@@ -123,6 +123,8 @@ at::Tensor lightning_indexer(
  * is inversed.
  */
 at::Tensor tri_inv_col_sweep(const at::Tensor &tensor_in);
+
+at::Tensor causal_conv1d(const at::Tensor &x, const at::Tensor &weight, const at::Tensor &bias);
 } // namespace npu_kernel
 
 } // namespace sglang

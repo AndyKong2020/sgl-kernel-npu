@@ -100,6 +100,89 @@ def prepare_data(
     return x_pad, initial_states, seqlens, indices
 
 
+def _get_batch_size(x: torch.Tensor, query_start_loc: torch.Tensor) -> int:
+    if x.ndim == 3:
+        return x.shape[0]
+    return query_start_loc.numel() - 1
+
+
+def _ensure_prefill_metadata(
+    x: torch.Tensor,
+    query_start_loc: Optional[torch.Tensor],
+    cache_indices: Optional[torch.Tensor],
+    has_initial_state: Optional[torch.Tensor],
+    conv_states: Optional[torch.Tensor],
+):
+    if query_start_loc is None:
+        if x.ndim != 3:
+            raise ValueError("query_start_loc is required for varlen causal_conv1d_fn_npu input")
+        batch, _, seqlen = x.shape
+        query_start_loc = torch.arange(
+            0, (batch + 1) * seqlen, seqlen, device=x.device, dtype=torch.int32
+        )
+
+    batch_size = _get_batch_size(x, query_start_loc)
+
+    if cache_indices is None and conv_states is not None:
+        cache_indices = torch.arange(batch_size, device=x.device, dtype=torch.int32)
+
+    if has_initial_state is None:
+        has_initial_state = torch.zeros(batch_size, device=x.device, dtype=torch.bool)
+    else:
+        has_initial_state = has_initial_state.to(device=x.device, dtype=torch.bool)
+
+    return query_start_loc, cache_indices, has_initial_state
+
+
+def _make_prefill_context(
+    x_pad: torch.Tensor,
+    initial_state_pad: Optional[torch.Tensor],
+    width: int,
+) -> torch.Tensor:
+    prefix_len = width - 1
+    if prefix_len <= 0:
+        return x_pad
+
+    if initial_state_pad is None:
+        initial_state_pad = torch.zeros(
+            (x_pad.size(0), x_pad.size(1), prefix_len),
+            device=x_pad.device,
+            dtype=x_pad.dtype,
+        )
+    return torch.cat([initial_state_pad, x_pad], dim=-1)
+
+
+def _gather_final_states_from_context(
+    full_context: torch.Tensor,
+    seqlens: torch.Tensor,
+    width: int,
+) -> torch.Tensor:
+    prefix_len = width - 1
+    if prefix_len <= 0:
+        return torch.empty(
+            (full_context.size(0), full_context.size(1), 0),
+            device=full_context.device,
+            dtype=full_context.dtype,
+        )
+
+    positions = seqlens.to(device=full_context.device, dtype=torch.long).unsqueeze(1)
+    positions = positions + torch.arange(prefix_len, device=full_context.device)
+    indices = positions.unsqueeze(1).expand(-1, full_context.size(1), -1)
+    return full_context.gather(2, indices)
+
+
+def _causal_conv1d_prefill_npu(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+) -> torch.Tensor:
+    return torch.ops.npu.causal_conv1d(
+        x.contiguous(),
+        weight.unsqueeze(1).contiguous(),
+        bias.contiguous(),
+    )
+
+
 def causal_conv1d_fn_npu(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -146,24 +229,53 @@ def causal_conv1d_fn_npu(
     if x.stride(-1) != 1:
         x = x.contiguous()
     bias = bias.contiguous() if bias is not None else None
+    query_start_loc, cache_indices, has_initial_state = _ensure_prefill_metadata(
+        x,
+        query_start_loc,
+        cache_indices,
+        has_initial_state,
+        conv_states,
+    )
 
-    assert query_start_loc[-1] <= x.shape[-1], f"{query_start_loc=}, {x.shape=}"
+    if x.ndim != 3:
+        assert query_start_loc[-1] <= x.shape[-1], f"{query_start_loc=}, {x.shape=}"
 
     x_pad, initial_state_pad, seqlens, indices = prepare_data(
         x, weight, query_start_loc, cache_indices, has_initial_state, conv_states
     )
 
-    out, final_states_out = causal_conv1d_fn_native(
-        x_pad,
-        weight,
-        bias,
-        seqlens=seqlens,
-        has_initial_state=has_initial_state,
-        initial_states=initial_state_pad,
-        activation=activation,
-        return_final_states=True,
+    use_prefill_npu = (
+        activation in ["silu", "swish"]
+        and weight.shape[-1] == 4
+        and hasattr(torch.ops.npu, "causal_conv1d")
     )
-    conv_states.index_copy_(0, cache_indices, final_states_out)
+
+    if use_prefill_npu:
+        bias_or_zero = (
+            bias
+            if bias is not None
+            else torch.zeros(weight.size(0), device=weight.device, dtype=weight.dtype)
+        )
+        full_context = _make_prefill_context(x_pad, initial_state_pad, weight.shape[-1])
+        out = _causal_conv1d_prefill_npu(full_context, weight, bias_or_zero)
+        out = out[..., -x_pad.size(-1) :].to(dtype=x.dtype)
+        final_states_out = _gather_final_states_from_context(
+            full_context, seqlens, weight.shape[-1]
+        ).to(dtype=x.dtype)
+    else:
+        out, final_states_out = causal_conv1d_fn_native(
+            x_pad,
+            weight,
+            bias,
+            seqlens=seqlens,
+            has_initial_state=has_initial_state,
+            initial_states=initial_state_pad,
+            activation=activation,
+            return_final_states=True,
+        )
+
+    if conv_states is not None and cache_indices is not None:
+        conv_states.index_copy_(0, cache_indices, final_states_out)
 
     if x.ndim == 3:
         return out  # [batch_size, dim, seq_len]
