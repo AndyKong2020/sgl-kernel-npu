@@ -10,7 +10,7 @@
 
 /*!
  * \file causal_conv1d_update_tilingdata.h
- * \brief tiling data struct
+ * \brief tiling data struct, aligned with vllm-ascend CausalConv1dTilingData
  */
 
 #ifndef CAUSAL_CONV1D_UPDATE_TILING_DATA_H_
@@ -22,29 +22,22 @@ namespace sglang {
 namespace npu_kernel {
 
 struct CausalConv1dUpdateTilingData {
-    // used core num
-    int64_t numCore;
-
-    // batch per core
-    int64_t blockFactor;
-    int64_t blockTailFactor;
-    // token per loop
-    // int64_t baseN;
-
-    // x [batch, seqlen, dim]
-    // weight [width, dim]
-    int64_t batch;
-    int64_t seqLen;
     int64_t dim;
+    int64_t seqLen;
+    int64_t batch;
     int64_t width;
     int64_t stateLen;
 
-    int64_t hasIndices;
-    int64_t hasBias;
-    int64_t hasNumAccept;
-    int64_t hasQueryLoc;
     int64_t activationMode;
     int64_t padSlotId;
+
+    int64_t hasBias;
+    int64_t hasIndices;
+    int64_t hasNumAccept;
+    int64_t hasQueryLoc;
+
+    int64_t dimTileSize;
+    int64_t blocksPerSeq;
 };
 
 }  // namespace npu_kernel

@@ -191,20 +191,23 @@ HOST_API at::Tensor causal_conv1d_update_impl(
 
     auto ascendc_platform = platform_ascendc::PlatformAscendCManager::GetInstance();
     int32_t max_aiv_core = static_cast<int32_t>(ascendc_platform->GetCoreNumAiv());
-    int32_t block_dim = std::min(max_aiv_core, static_cast<int32_t>(batch));
-    if (block_dim == 0) {
-        block_dim = 1;
-    }
     int32_t workspace_size = static_cast<int32_t>(ascendc_platform->GetLibApiWorkSpaceSize());
 
-    // 1. Prepare Tiling Data Struct
+    // 1. Prepare Tiling Data Struct (uses vllm-style ChooseDimTileSize)
     CausalConv1dUpdateTilingData tiling_data;
     SGLang::CausalConv1dUpdate::ComputeTilingData(
         batch, seq_len, dim, width, state_len,
         has_indices, has_bias, has_num_accept, has_query_loc,
-        activation_mode, pad_slot_id, block_dim,
+        activation_mode, pad_slot_id, max_aiv_core,
         tiling_data
     );
+
+    // block_dim = min(cores, gridSize) where gridSize = batch * blocksPerSeq
+    int64_t grid_size = batch * tiling_data.blocksPerSeq;
+    int32_t block_dim = std::min(max_aiv_core, static_cast<int32_t>(grid_size));
+    if (block_dim == 0) {
+        block_dim = 1;
+    }
 
     const int64_t tiling_size =
         (sizeof(CausalConv1dUpdateTilingData) + PADDING_BYTE - 1) / PADDING_BYTE * PADDING_BYTE;

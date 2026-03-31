@@ -10,365 +10,467 @@
 
 /*!
  * \file causal_conv1d_update.h
- * \brief causal_conv1d_update kernel
+ * \brief causal_conv1d_update kernel implementation.
+ *        Kernel logic aligned with vllm-ascend PR#7495 causal_conv1d.h,
+ *        only wrapper (tiling data parsing, entry points) differs.
  */
 
 #ifndef CAUSAL_CONV1D_UPDATE_H
 #define CAUSAL_CONV1D_UPDATE_H
 
-#include "causal_conv1d_update_base.h"
+#include "kernel_operator.h"
+#include "kernel_tiling/kernel_tiling.h"
+#include "causal_conv1d_update_tilingdata.h"
+#include "causal_conv1d_update_common.h"
 
 namespace CausalConv1dUpdateOp {
+
 using namespace AscendC;
+using sglang::npu_kernel::CausalConv1dUpdateTilingData;
+
 template <typename T>
-class CausalConv1dUpdate : public CausalConv1dUpdateBase<T> {
+class CausalConv1dUpdate {
 public:
-    __aicore__ inline CausalConv1dUpdate(){};
+    __aicore__ inline CausalConv1dUpdate() = default;
+
     __aicore__ inline void Init(GM_ADDR x, GM_ADDR weight, GM_ADDR convState, GM_ADDR convStateIndices,
                                 GM_ADDR bias, GM_ADDR numAcceptedTokens, GM_ADDR queryStartLoc,
                                 GM_ADDR y, GM_ADDR tiling);
     __aicore__ inline void Process();
 
 private:
-    __aicore__ inline void ComputeUpdate(int64_t xOffset);
-    __aicore__ inline void CopyInX(int64_t xLen, int64_t xInOffset);
-    __aicore__ inline void CopyInWeight(int64_t weightLen, int64_t weightInOffset);
-    __aicore__ inline void CopyInState(int64_t stateLen, int64_t stateInOffset);
-    __aicore__ inline void CopyInBias(int64_t biasLen, int64_t biasInOffset);
-    __aicore__ inline void CopyOutY(int64_t yLen, int64_t yOutOffset);
-    __aicore__ inline void CopyOutState(int64_t stateLen, int64_t stateOutOffset);
+    __aicore__ inline void LoadWeightAndBias(int32_t c0, int32_t dimTileSize);
+    __aicore__ inline void InitRing(int32_t cacheIdx, int32_t stateTokenOffset, int32_t start, int32_t len,
+                                    int32_t c0, int32_t dimTileSize, int32_t dim);
+    __aicore__ inline void RunSeq(int32_t start, int32_t len, int32_t c0, int32_t dimTileSize, int32_t dim);
+    __aicore__ inline void WriteBackState(int32_t cacheIdx, int32_t len, int32_t c0, int32_t dimTileSize, int32_t dim);
+    __aicore__ inline void AllocEvents();
+    __aicore__ inline void ReleaseEvents();
 
 private:
-    // constexpr static int32_t bufferNum_ = 2;
-    TPipe pipe_;
-    // TQue<QuePosition::VECIN, 1> inQueueX_;
-    TQue<QuePosition::VECIN, 1> inQueueWeight_;
-    // TQue<QuePosition::VECIN, 1> inQueueState_;
-    TQue<QuePosition::VECIN, 1> inQueueBias_;
-    TQue<QuePosition::VECOUT, 1> outQueueY_;
+    TPipe pipe;
+    TBuf<QuePosition::VECIN> inBuf;
+    TBuf<QuePosition::VECOUT> outBuf;
+    TBuf<QuePosition::VECCALC> calcBuf;
 
-    TBuf<QuePosition::VECCALC> inputBuf_;
-    TBuf<QuePosition::VECCALC> castBufInput_;
-    TBuf<QuePosition::VECCALC> castBufWeight_;
-    TBuf<QuePosition::VECCALC> resultBuf_;
+    TEventID weightBiasMte2ToVEvent_;
+    TEventID stateMte2ToVEvent_;
+    TEventID inputMte2ToVEvent_[RING_SLOTS];
+    TEventID inputVToMte2Event_;
+    TEventID outMte3ToVEvent_[2];
+    TEventID outVToMte3Event_[2];
+    TEventID stateWritebackMte3ToVEvent_;
+    TEventID stateWritebackMte3ToMte2Event_;
 
-    GlobalTensor<T> xGm_;
-    GlobalTensor<T> weightGm_;
-    GlobalTensor<T> convStateGm_;
-    GlobalTensor<int32_t> convStateIndicesGm_;
-    GlobalTensor<T> biasGm_;
-    GlobalTensor<int32_t> numAcceptGm_;
-    GlobalTensor<int32_t> queryLocGm_;
-    GlobalTensor<T> yGm_;
-
-    LocalTensor<T> inLocal;
-    LocalTensor<float> resultLocal;
-    LocalTensor<float> castIn;
-    LocalTensor<float> castWeight;
+    GlobalTensor<T> xGm;
+    GlobalTensor<T> weightGm;
+    GlobalTensor<T> biasGm;
+    GlobalTensor<T> convStatesGm;
+    GlobalTensor<int32_t> convStateIndicesGm;
+    GlobalTensor<int32_t> numAcceptGm;
+    GlobalTensor<int32_t> queryStartLocGm;
+    GlobalTensor<T> yGm;
 
     CausalConv1dUpdateTilingData tilingData_;
-    int32_t blockIdx_ = 0;
-    int64_t gmXOffset_ = 0;
-    int64_t gmStateOffset_ = 0;
-    int64_t batchNum_ = 1;
-    int64_t inStateOffset_ = 0;
 
-    __aicore__ inline void MTE2ToVSync()
-    {
-        event_t eventIDMTE2ToV = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE2_V));
-        SetFlag<HardEvent::MTE2_V>(eventIDMTE2ToV);
-        WaitFlag<HardEvent::MTE2_V>(eventIDMTE2ToV);
-    }
-
-    __aicore__ inline void MTE3ToMTE2Sync()
-    {
-        event_t eventIDMTE3ToMTE2 = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_MTE2));
-        SetFlag<HardEvent::MTE3_MTE2>(eventIDMTE3ToMTE2);
-        WaitFlag<HardEvent::MTE3_MTE2>(eventIDMTE3ToMTE2);
-    }
-
-    __aicore__ inline void MTE2ToMTE3Sync()
-    {
-        event_t eventIDMTE2ToMTE3 = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE2_MTE3));
-        SetFlag<HardEvent::MTE2_MTE3>(eventIDMTE2ToMTE3);
-        WaitFlag<HardEvent::MTE2_MTE3>(eventIDMTE2ToMTE3);
-    }
-
-    __aicore__ inline void VToMTE2Sync()
-    {
-        event_t eventIDVToMTE2 = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::V_MTE2));
-        SetFlag<HardEvent::V_MTE2>(eventIDVToMTE2);
-        WaitFlag<HardEvent::V_MTE2>(eventIDVToMTE2);
-    }
+    bool weightCacheValid_ {false};
+    int32_t cachedC0_ {-1};
+    int32_t cachedDimTileSize_ {-1};
 };
 
+// ---------------------------------------------------------------------------
+// Init: parse tiling data, set up GM tensors, allocate fixed-size buffers
+// ---------------------------------------------------------------------------
 template <typename T>
-__aicore__ inline void CausalConv1dUpdate<T>::Init(GM_ADDR x, GM_ADDR weight, GM_ADDR convState, GM_ADDR convStateIndices,
-                                                   GM_ADDR bias, GM_ADDR numAcceptedTokens, GM_ADDR queryStartLoc,
+__aicore__ inline void CausalConv1dUpdate<T>::Init(GM_ADDR x, GM_ADDR weight, GM_ADDR convState,
+                                                   GM_ADDR convStateIndices, GM_ADDR bias,
+                                                   GM_ADDR numAcceptedTokens, GM_ADDR queryStartLoc,
                                                    GM_ADDR y, GM_ADDR tiling)
 {
-    blockIdx_ = GetBlockIdx();
-    xGm_.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(x));
-    weightGm_.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(weight));
-    convStateGm_.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(convState));
-    convStateIndicesGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(convStateIndices));
-    biasGm_.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(bias));
-    numAcceptGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(numAcceptedTokens));
-    queryLocGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(queryStartLoc));
-    yGm_.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(y));
+    // --- sgl-specific wrapper: parse tiling from raw GM bytes ---
+    auto td = reinterpret_cast<__gm__ CausalConv1dUpdateTilingData*>(tiling);
+    tilingData_.dim = td->dim;
+    tilingData_.seqLen = td->seqLen;
+    tilingData_.batch = td->batch;
+    tilingData_.width = td->width;
+    tilingData_.stateLen = td->stateLen;
+    tilingData_.activationMode = td->activationMode;
+    tilingData_.padSlotId = td->padSlotId;
+    tilingData_.hasBias = td->hasBias;
+    tilingData_.hasIndices = td->hasIndices;
+    tilingData_.hasNumAccept = td->hasNumAccept;
+    tilingData_.hasQueryLoc = td->hasQueryLoc;
+    tilingData_.dimTileSize = td->dimTileSize;
+    tilingData_.blocksPerSeq = td->blocksPerSeq;
 
-    // Parse tiling data directly
-    auto tiling_data = reinterpret_cast<__gm__ sglang::npu_kernel::CausalConv1dUpdateTilingData*>(tiling);
-    tilingData_.numCore = tiling_data->numCore;
-    tilingData_.blockFactor = tiling_data->blockFactor;
-    tilingData_.blockTailFactor = tiling_data->blockTailFactor;
-    tilingData_.batch = tiling_data->batch;
-    tilingData_.seqLen = tiling_data->seqLen;
-    tilingData_.dim = tiling_data->dim;
-    tilingData_.width = tiling_data->width;
-    tilingData_.stateLen = tiling_data->stateLen;
-    tilingData_.hasIndices = tiling_data->hasIndices;
-    tilingData_.hasBias = tiling_data->hasBias;
-    tilingData_.hasNumAccept = tiling_data->hasNumAccept;
-    tilingData_.hasQueryLoc = tiling_data->hasQueryLoc;
-    tilingData_.activationMode = tiling_data->activationMode;
-    this->ParseCoreBlocks(tilingData_, blockIdx_, batchNum_);
+    weightCacheValid_ = false;
+    cachedC0_ = -1;
+    cachedDimTileSize_ = -1;
 
-    // alloc TQue
-    // pipe_.InitBuffer(inQueueX_, 1, tilingData_.dim * sizeof(T));
-    pipe_.InitBuffer(inQueueWeight_, 1, tilingData_.width * tilingData_.dim * sizeof(T));
-    // pipe_.InitBuffer(inQueueState_, 1, tilingData_.dim * sizeof(T));
-    pipe_.InitBuffer(inQueueBias_, 1, tilingData_.dim * sizeof(T));
-    pipe_.InitBuffer(outQueueY_, 1, tilingData_.dim * sizeof(T));
+    // --- GM tensor setup (identical pattern to vllm) ---
+    xGm.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(x));
+    weightGm.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(weight));
+    if (tilingData_.hasBias != 0) {
+        biasGm.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(bias));
+    }
+    convStatesGm.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(convState));
+    if (tilingData_.hasIndices != 0) {
+        convStateIndicesGm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(convStateIndices));
+    }
+    if (tilingData_.hasNumAccept != 0) {
+        numAcceptGm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(numAcceptedTokens));
+    }
+    if (tilingData_.hasQueryLoc != 0) {
+        queryStartLocGm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(queryStartLoc));
+    }
+    yGm.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(y));
 
-    // alloc TBuf
-    pipe_.InitBuffer(inputBuf_, tilingData_.dim * sizeof(T));
-    pipe_.InitBuffer(castBufInput_, tilingData_.dim * sizeof(float));
-    pipe_.InitBuffer(castBufWeight_, tilingData_.dim * sizeof(float));
-    pipe_.InitBuffer(resultBuf_, tilingData_.dim * sizeof(float));
+    // --- Fixed-size buffer allocation (matches vllm) ---
+    pipe.InitBuffer(inBuf, RING_SLOTS * MAX_BLOCK_DIM * sizeof(T));
+    pipe.InitBuffer(outBuf, 2 * MAX_BLOCK_DIM * sizeof(T));
+    pipe.InitBuffer(calcBuf, (MAX_WIDTH + 3) * MAX_BLOCK_DIM * sizeof(float));
+
+    AllocEvents();
+}
+
+// ---------------------------------------------------------------------------
+// AllocEvents / ReleaseEvents: pre-allocate event IDs (matches vllm)
+// ---------------------------------------------------------------------------
+template <typename T>
+__aicore__ inline void CausalConv1dUpdate<T>::AllocEvents()
+{
+    weightBiasMte2ToVEvent_ = GetTPipePtr()->AllocEventID<HardEvent::MTE2_V>();
+    stateMte2ToVEvent_ = GetTPipePtr()->AllocEventID<HardEvent::MTE2_V>();
+    for (int32_t i = 0; i < RING_SLOTS; ++i) {
+        inputMte2ToVEvent_[i] = GetTPipePtr()->AllocEventID<HardEvent::MTE2_V>();
+    }
+    inputVToMte2Event_ = GetTPipePtr()->AllocEventID<HardEvent::V_MTE2>();
+    outMte3ToVEvent_[0] = GetTPipePtr()->AllocEventID<HardEvent::MTE3_V>();
+    outMte3ToVEvent_[1] = GetTPipePtr()->AllocEventID<HardEvent::MTE3_V>();
+    outVToMte3Event_[0] = GetTPipePtr()->AllocEventID<HardEvent::V_MTE3>();
+    outVToMte3Event_[1] = GetTPipePtr()->AllocEventID<HardEvent::V_MTE3>();
+    stateWritebackMte3ToVEvent_ = GetTPipePtr()->AllocEventID<HardEvent::MTE3_V>();
+    stateWritebackMte3ToMte2Event_ = GetTPipePtr()->AllocEventID<HardEvent::MTE3_MTE2>();
 }
 
 template <typename T>
-__aicore__ inline void CausalConv1dUpdate<T>::Process()
+__aicore__ inline void CausalConv1dUpdate<T>::ReleaseEvents()
 {
-    if (blockIdx_ >= tilingData_.numCore) {
+    GetTPipePtr()->ReleaseEventID<HardEvent::MTE2_V>(weightBiasMte2ToVEvent_);
+    GetTPipePtr()->ReleaseEventID<HardEvent::MTE2_V>(stateMte2ToVEvent_);
+    for (int32_t i = 0; i < RING_SLOTS; ++i) {
+        GetTPipePtr()->ReleaseEventID<HardEvent::MTE2_V>(inputMte2ToVEvent_[i]);
+    }
+    GetTPipePtr()->ReleaseEventID<HardEvent::V_MTE2>(inputVToMte2Event_);
+    GetTPipePtr()->ReleaseEventID<HardEvent::MTE3_V>(outMte3ToVEvent_[0]);
+    GetTPipePtr()->ReleaseEventID<HardEvent::MTE3_V>(outMte3ToVEvent_[1]);
+    GetTPipePtr()->ReleaseEventID<HardEvent::V_MTE3>(outVToMte3Event_[0]);
+    GetTPipePtr()->ReleaseEventID<HardEvent::V_MTE3>(outVToMte3Event_[1]);
+    GetTPipePtr()->ReleaseEventID<HardEvent::MTE3_V>(stateWritebackMte3ToVEvent_);
+    GetTPipePtr()->ReleaseEventID<HardEvent::MTE3_MTE2>(stateWritebackMte3ToMte2Event_);
+}
+
+// ---------------------------------------------------------------------------
+// LoadWeightAndBias: per-row strided copy (identical to vllm)
+// ---------------------------------------------------------------------------
+template <typename T>
+__aicore__ inline void CausalConv1dUpdate<T>::LoadWeightAndBias(int32_t c0, int32_t dimTileSize)
+{
+    const int32_t dim = static_cast<int32_t>(tilingData_.dim);
+    const int32_t width = static_cast<int32_t>(tilingData_.width);
+    const int32_t jStart = MAX_WIDTH - width;
+    LocalTensor<float> calc = calcBuf.Get<float>();
+    LocalTensor<float> weightF = calc;
+    LocalTensor<float> biasF = weightF[MAX_WIDTH * MAX_BLOCK_DIM];
+    const bool hasBias = (tilingData_.hasBias != 0);
+
+    for (int32_t j = 0; j < width; ++j) {
+        const int32_t jDst = jStart + j;
+        const int64_t weightOffset = static_cast<int64_t>(j) * dim + c0;
+
+        if constexpr (std::is_same<T, float>::value) {
+            DataCopy(weightF[jDst * MAX_BLOCK_DIM], weightGm[weightOffset], dimTileSize);
+        } else {
+            DataCopy(weightF.ReinterpretCast<T>()[jDst * MAX_BLOCK_DIM * 2 + MAX_BLOCK_DIM],
+                     weightGm[weightOffset], dimTileSize);
+        }
+    }
+
+    if (hasBias) {
+        if constexpr (std::is_same<T, float>::value) {
+            DataCopy(biasF, biasGm[c0], dimTileSize);
+        } else {
+            DataCopy(biasF.ReinterpretCast<T>()[MAX_BLOCK_DIM], biasGm[c0], dimTileSize);
+        }
+    }
+
+    SetFlag<HardEvent::MTE2_V>(weightBiasMte2ToVEvent_);
+    WaitFlag<HardEvent::MTE2_V>(weightBiasMte2ToVEvent_);
+
+    if constexpr (!std::is_same<T, float>::value) {
+        for (int32_t j = 0; j < width; ++j) {
+            const int32_t jDst = jStart + j;
+            Cast(weightF[jDst * MAX_BLOCK_DIM],
+                 weightF.ReinterpretCast<T>()[jDst * MAX_BLOCK_DIM * 2 + MAX_BLOCK_DIM],
+                 RoundMode::CAST_NONE, dimTileSize);
+        }
+        if (hasBias) {
+            Cast(biasF, biasF.ReinterpretCast<T>()[MAX_BLOCK_DIM],
+                 RoundMode::CAST_NONE, dimTileSize);
+        }
+    }
+
+    if (!hasBias) {
+        Duplicate(biasF, 0.0f, dimTileSize);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// InitRing: load conv_state into ring buffer + prefetch first input (matches vllm)
+// ---------------------------------------------------------------------------
+template <typename T>
+__aicore__ inline void CausalConv1dUpdate<T>::InitRing(int32_t cacheIdx, int32_t stateTokenOffset,
+                                                       int32_t start, int32_t len,
+                                                       int32_t c0, int32_t dimTileSize, int32_t dim)
+{
+    const int32_t stateLen = static_cast<int32_t>(tilingData_.stateLen);
+    const int32_t width = static_cast<int32_t>(tilingData_.width);
+    const int32_t ringStart = MAX_WIDTH - width;
+    LocalTensor<T> ring = inBuf.Get<T>();
+
+    // Load existing conv_state into ring buffer
+    for (int32_t i = 0; i < (width - 1); ++i) {
+        const int32_t pos = stateTokenOffset + i;
+        const int64_t stateOffset = static_cast<int64_t>(cacheIdx) * stateLen * dim +
+                                    static_cast<int64_t>(pos) * dim + c0;
+        DataCopy(ring[(ringStart + i) * MAX_BLOCK_DIM], convStatesGm[stateOffset], dimTileSize);
+    }
+    SetFlag<HardEvent::MTE2_V>(stateMte2ToVEvent_);
+    WaitFlag<HardEvent::MTE2_V>(stateMte2ToVEvent_);
+
+    // Prefetch first input token
+    if (len > 0) {
+        const int32_t slot0 = SlotCurr(0);
+        const int64_t xOffset = static_cast<int64_t>(start) * dim + c0;
+        DataCopy(ring[slot0 * MAX_BLOCK_DIM], xGm[xOffset], dimTileSize);
+        SetFlag<HardEvent::MTE2_V>(inputMte2ToVEvent_[slot0]);
+    }
+
+    if (len > 1) {
+        SetFlag<HardEvent::V_MTE2>(inputVToMte2Event_);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RunSeq: compute conv1d with ring buffer (matches vllm)
+// ---------------------------------------------------------------------------
+template <typename T>
+__aicore__ inline void CausalConv1dUpdate<T>::RunSeq(int32_t start, int32_t len, int32_t c0,
+                                                     int32_t dimTileSize, int32_t dim)
+{
+    const int32_t width = static_cast<int32_t>(tilingData_.width);
+    const int32_t jStart = MAX_WIDTH - width;
+    LocalTensor<float> calc = calcBuf.Get<float>();
+    LocalTensor<float> weightF = calc;
+    LocalTensor<float> biasF = weightF[MAX_WIDTH * MAX_BLOCK_DIM];
+    LocalTensor<float> accF = biasF[MAX_BLOCK_DIM];
+    LocalTensor<float> tmpF = accF[MAX_BLOCK_DIM];
+    LocalTensor<T> ring = inBuf.Get<T>();
+    LocalTensor<T> outT = outBuf.Get<T>();
+    const bool hasActivation = (tilingData_.activationMode != 0);
+
+    for (int32_t t = 0; t < len; ++t) {
+        const int32_t slotCurr = SlotCurr(t);
+
+        WaitFlag<HardEvent::MTE2_V>(inputMte2ToVEvent_[slotCurr]);
+
+        // Prefetch next input token
+        if (t + 1 < len) {
+            const int32_t slotNext = SlotPrefetch(t);
+            const int64_t xOffsetNext = static_cast<int64_t>(start + t + 1) * dim + c0;
+            WaitFlag<HardEvent::V_MTE2>(inputVToMte2Event_);
+            DataCopy(ring[slotNext * MAX_BLOCK_DIM], xGm[xOffsetNext], dimTileSize);
+            SetFlag<HardEvent::MTE2_V>(inputMte2ToVEvent_[slotNext]);
+        }
+
+        // Initialize accumulator with bias
+        DataCopy(accF, biasF, dimTileSize);
+        PipeBarrier<PIPE_V>();
+
+        // Convolution dot product
+        for (int32_t j = jStart; j < MAX_WIDTH; ++j) {
+            const int32_t tap = (MAX_WIDTH - 1) - j;
+            const int32_t slot = (tap == 0) ? slotCurr : SlotHist(t, tap);
+            Cast(tmpF, ring[slot * MAX_BLOCK_DIM], RoundMode::CAST_NONE, dimTileSize);
+            MulAddDst(accF, tmpF, weightF[j * MAX_BLOCK_DIM], dimTileSize);
+        }
+
+        // Activation (SiLU)
+        if (hasActivation) {
+            Silu(tmpF, accF, dimTileSize);
+        }
+
+        // Cast and write output (double-buffered, matches vllm)
+        const int32_t outSlot = t & 1;
+        LocalTensor<T> outSlotT = outT[outSlot * MAX_BLOCK_DIM];
+        if (t >= 2) {
+            WaitFlag<HardEvent::MTE3_V>(outMte3ToVEvent_[outSlot]);
+        }
+        if constexpr (IsSameType<T, float>::value) {
+            if (hasActivation) {
+                DataCopy(outSlotT, tmpF, dimTileSize);
+            } else {
+                DataCopy(outSlotT, accF, dimTileSize);
+            }
+        } else {
+            if (hasActivation) {
+                Cast(outSlotT, tmpF, RoundMode::CAST_RINT, dimTileSize);
+            } else {
+                Cast(outSlotT, accF, RoundMode::CAST_RINT, dimTileSize);
+            }
+        }
+
+        SetFlag<HardEvent::V_MTE3>(outVToMte3Event_[outSlot]);
+
+        const int64_t outOffset = static_cast<int64_t>(start + t) * dim + c0;
+
+        WaitFlag<HardEvent::V_MTE3>(outVToMte3Event_[outSlot]);
+        DataCopy(yGm[outOffset], outSlotT, dimTileSize);
+        if (t + 2 < len) {
+            SetFlag<HardEvent::MTE3_V>(outMte3ToVEvent_[outSlot]);
+        }
+
+        if (t + 2 < len) {
+            SetFlag<HardEvent::V_MTE2>(inputVToMte2Event_);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WriteBackState: write ring buffer back to conv_state (matches vllm)
+// ---------------------------------------------------------------------------
+template <typename T>
+__aicore__ inline void CausalConv1dUpdate<T>::WriteBackState(int32_t cacheIdx, int32_t len, int32_t c0,
+                                                             int32_t dimTileSize, int32_t dim)
+{
+    const int32_t stateLen = static_cast<int32_t>(tilingData_.stateLen);
+    const int32_t width = static_cast<int32_t>(tilingData_.width);
+    if (len <= 0) {
         return;
     }
 
-    if (tilingData_.hasQueryLoc) {
-        gmXOffset_ = queryLocGm_.GetValue(blockIdx_ * tilingData_.blockFactor) * tilingData_.dim;
-    } else {
-        gmXOffset_ = blockIdx_ * tilingData_.blockFactor * tilingData_.seqLen * tilingData_.dim;
+    const int32_t lastT = len - 1;
+    LocalTensor<T> ring = inBuf.Get<T>();
+
+    for (int32_t pos = 0; pos < (width - 1); ++pos) {
+        const int32_t tap = (width - 2) - pos;
+        const int32_t slot = (tap == 0) ? SlotCurr(lastT) : SlotHist(lastT, tap);
+        const int64_t stateOffset = static_cast<int64_t>(cacheIdx) * stateLen * dim +
+                                    static_cast<int64_t>(pos) * dim + c0;
+        DataCopy(convStatesGm[stateOffset], ring[slot * MAX_BLOCK_DIM], dimTileSize);
     }
-
-    CopyInWeight(tilingData_.width * tilingData_.dim, 0);
-
-    ComputeUpdate(gmXOffset_);
 }
 
+// ---------------------------------------------------------------------------
+// Process: grid distribution over (batch, dimBlock) pairs (matches vllm)
+// ---------------------------------------------------------------------------
 template <typename T>
-__aicore__ inline void CausalConv1dUpdate<T>::ComputeUpdate(int64_t xOffset)
+__aicore__ inline void CausalConv1dUpdate<T>::Process()
 {
-    LocalTensor<T> wLocal = inQueueWeight_.DeQue<T>();
-    inLocal = inputBuf_.Get<T>();
-    resultLocal = resultBuf_.Get<float>();
-    castIn = castBufInput_.Get<float>();
-    castWeight = castBufWeight_.Get<float>();
-    int64_t stateOffset = 0;
+    const int32_t dim = static_cast<int32_t>(tilingData_.dim);
+    const int32_t batch = static_cast<int32_t>(tilingData_.batch);
+    const int32_t seqLen = static_cast<int32_t>(tilingData_.seqLen);
+    const int32_t dimTileSize = static_cast<int32_t>(tilingData_.dimTileSize);
+    const int32_t blocksPerSeq = static_cast<int32_t>(tilingData_.blocksPerSeq);
+    const int32_t width = static_cast<int32_t>(tilingData_.width);
 
-    if(!tilingData_.hasIndices) {
-        gmStateOffset_ = blockIdx_ * tilingData_.blockFactor * tilingData_.stateLen * tilingData_.dim;
+    const uint32_t blockIdx = GetBlockIdx();
+    const uint32_t blockNum = GetBlockNum();
+
+    if (dimTileSize <= 0 || blocksPerSeq <= 0 || dimTileSize > MAX_BLOCK_DIM ||
+        width < 2 || width > MAX_WIDTH) {
+        ReleaseEvents();
+        return;
     }
 
-    for (int64_t i = 0; i < batchNum_; ++i) {
-        // Resolve the state offset for the current batch item.
-        if (tilingData_.hasIndices) {
-            int64_t stateIdx = convStateIndicesGm_.GetValue(blockIdx_ * tilingData_.blockFactor + i);
-            if (stateIdx == tilingData_.padSlotId) {
+    const int64_t gridSize = static_cast<int64_t>(batch) * blocksPerSeq;
+    for (int64_t task = static_cast<int64_t>(blockIdx); task < gridSize;
+         task += static_cast<int64_t>(blockNum)) {
+
+        const int32_t seq = static_cast<int32_t>(task / blocksPerSeq);
+        const int32_t dimBlockId = static_cast<int32_t>(task % blocksPerSeq);
+        const int32_t c0 = dimBlockId * dimTileSize;
+        if (c0 >= dim) {
+            continue;
+        }
+        const int32_t dimTileSizeActual = (c0 + dimTileSize <= dim) ? dimTileSize : (dim - c0);
+
+        // Determine sequence range
+        int32_t start = 0;
+        int32_t len = 0;
+        if (tilingData_.hasQueryLoc != 0) {
+            start = queryStartLocGm.GetValue(seq);
+            const int32_t end = queryStartLocGm.GetValue(seq + 1);
+            len = end - start;
+        } else {
+            start = seq * seqLen;
+            len = seqLen;
+        }
+
+        if (len <= 0) {
+            continue;
+        }
+
+        // Resolve cache index
+        int32_t cacheIdx = seq;
+        if (tilingData_.hasIndices != 0) {
+            cacheIdx = convStateIndicesGm.GetValue(seq);
+            if (cacheIdx == static_cast<int32_t>(tilingData_.padSlotId)) {
                 continue;
             }
-            stateOffset = tilingData_.stateLen * tilingData_.dim * stateIdx;
-        } else {
-            stateOffset = gmStateOffset_ + i * tilingData_.stateLen * tilingData_.dim;
         }
 
-        int64_t actSeqLen = tilingData_.seqLen;
-        if (tilingData_.hasQueryLoc) {
-            int64_t startLoc = queryLocGm_.GetValue(blockIdx_ * tilingData_.blockFactor + i);
-            int64_t endLoc = queryLocGm_.GetValue(blockIdx_ * tilingData_.blockFactor + i + 1);
-            actSeqLen = endLoc - startLoc;
+        // Speculative decoding: determine state token offset (matches vllm)
+        int32_t stateTokenOffset = 0;
+        if (tilingData_.hasNumAccept != 0 && width == MAX_WIDTH) {
+            const int32_t accepted = numAcceptGm.GetValue(seq);
+            stateTokenOffset = accepted - 1;
+            const int32_t maxOffset = static_cast<int32_t>(tilingData_.stateLen - (width - 1));
+            if (stateTokenOffset < 0) {
+                stateTokenOffset = 0;
+            } else if (stateTokenOffset > maxOffset) {
+                stateTokenOffset = maxOffset;
+            }
         }
 
-        int64_t numAccept = actSeqLen;
-        if (tilingData_.hasNumAccept) {
-            numAccept = numAcceptGm_.GetValue(blockIdx_ * tilingData_.blockFactor + i);
-            inStateOffset_ = numAccept - 1;
+        // Weight caching across iterations (matches vllm)
+        const bool weightCacheHit =
+            weightCacheValid_ && (cachedC0_ == c0) && (cachedDimTileSize_ == dimTileSizeActual);
+        if (!weightCacheHit) {
+            LoadWeightAndBias(c0, dimTileSizeActual);
+            weightCacheValid_ = true;
+            cachedC0_ = c0;
+            cachedDimTileSize_ = dimTileSizeActual;
         }
 
-        int64_t calcSeqLen = numAccept < actSeqLen ? numAccept : actSeqLen;
-        for (int64_t j = 0; j < calcSeqLen; ++j) {
-            Duplicate<float>(resultLocal, 0, tilingData_.dim);
-            LocalTensor<T> outLocal = outQueueY_.AllocTensor<T>();
-            for (int64_t k = 0; k < tilingData_.width - 1; ++k) {
-                // Walk the history window from oldest to newest cached token.
-                CopyInState(tilingData_.dim, stateOffset + (k + inStateOffset_) * tilingData_.dim);
-                MTE2ToMTE3Sync();
+        InitRing(cacheIdx, stateTokenOffset, start, len, c0, dimTileSizeActual, dim);
+        RunSeq(start, len, c0, dimTileSizeActual, dim);
 
-                if ((k + inStateOffset_) != 0) {
-                    // Shift the cached state left once there is a previous slot to overwrite.
-                    CopyOutState(tilingData_.dim, stateOffset + (k + inStateOffset_ -1) * tilingData_.dim);
-                    MTE3ToMTE2Sync();
-                }
+        // Fence before state writeback (matches vllm)
+        SetFlag<HardEvent::MTE3_V>(stateWritebackMte3ToVEvent_);
+        WaitFlag<HardEvent::MTE3_V>(stateWritebackMte3ToVEvent_);
+        SetFlag<HardEvent::MTE3_MTE2>(stateWritebackMte3ToMte2Event_);
+        WaitFlag<HardEvent::MTE3_MTE2>(stateWritebackMte3ToMte2Event_);
 
-                MTE2ToVSync();
-                Cast(castIn, inLocal, RoundMode::CAST_NONE, tilingData_.dim);
-                Cast(castWeight, wLocal[k * tilingData_.dim], RoundMode::CAST_NONE, tilingData_.dim);
-                MulAddDst(resultLocal, castIn, castWeight, tilingData_.dim);
+        WriteBackState(cacheIdx, len, c0, dimTileSizeActual, dim);
 
-                VToMTE2Sync();
-            }
-            // Append the current token to the newest conv_state slot.
-            CopyInX(tilingData_.dim, xOffset + j * tilingData_.dim);
-            MTE2ToMTE3Sync();
-            CopyOutState(tilingData_.dim, stateOffset + (inStateOffset_ + tilingData_.width - 2) * tilingData_.dim);
-            MTE3ToMTE2Sync();
-
-            MTE2ToVSync();
-            Cast(castIn, inLocal, RoundMode::CAST_NONE, tilingData_.dim);
-            Cast(castWeight, wLocal[(tilingData_.width - 1) * tilingData_.dim], RoundMode::CAST_NONE, tilingData_.dim);
-            MulAddDst(resultLocal, castIn, castWeight, tilingData_.dim);
-
-            if (tilingData_.hasBias) {
-                CopyInBias(tilingData_.dim, 0);
-                LocalTensor<T> biasLocal = inQueueBias_.DeQue<T>();
-                Cast(castIn, biasLocal, RoundMode::CAST_NONE, tilingData_.dim);
-                Add(resultLocal, castIn, resultLocal, tilingData_.dim);
-                inQueueBias_.FreeTensor(biasLocal);
-            }
-
-            if (tilingData_.activationMode) {
-                Muls(castWeight, resultLocal, (float)-1.0, tilingData_.dim);
-                Exp(castWeight, castWeight, tilingData_.dim);
-                Adds(castWeight, castWeight, (float)1.0, tilingData_.dim);
-                Div(resultLocal, resultLocal, castWeight, tilingData_.dim);
-            }
-
-            Cast(outLocal, resultLocal, RoundMode::CAST_ROUND, tilingData_.dim);
-
-            outQueueY_.EnQue(outLocal);
-            CopyOutY(tilingData_.dim, xOffset + j * tilingData_.dim);
-        }
-
-        for (int64_t j = 0; j < actSeqLen - calcSeqLen; ++j) {
-            Duplicate<float>(resultLocal, 0, tilingData_.dim);
-            LocalTensor<T> outLocal = outQueueY_.AllocTensor<T>();
-            for (int64_t k = 0; k < tilingData_.width - 1; ++k) {
-                CopyInState(tilingData_.dim, stateOffset + (k + inStateOffset_ + j) * tilingData_.dim);
-
-                MTE2ToVSync();
-                Cast(castIn, inLocal, RoundMode::CAST_NONE, tilingData_.dim);
-                Cast(castWeight, wLocal[k * tilingData_.dim], RoundMode::CAST_NONE, tilingData_.dim);
-                MulAddDst(resultLocal, castIn, castWeight, tilingData_.dim);
-
-                VToMTE2Sync();
-            }
-
-            CopyInX(tilingData_.dim, xOffset + (calcSeqLen + j) * tilingData_.dim);
-            MTE2ToMTE3Sync();
-            CopyOutState(tilingData_.dim, stateOffset + (inStateOffset_ + tilingData_.width - 1 + j) * tilingData_.dim);
-            MTE3ToMTE2Sync();
-
-            MTE2ToVSync();
-            Cast(castIn, inLocal, RoundMode::CAST_NONE, tilingData_.dim);
-            Cast(castWeight, wLocal[(tilingData_.width - 1) * tilingData_.dim], RoundMode::CAST_NONE, tilingData_.dim);
-            MulAddDst(resultLocal, castIn, castWeight, tilingData_.dim);
-
-            if (tilingData_.hasBias) {
-                CopyInBias(tilingData_.dim, 0);
-                LocalTensor<T> biasLocal = inQueueBias_.DeQue<T>();
-                Cast(castIn, biasLocal, RoundMode::CAST_NONE, tilingData_.dim);
-                Add(resultLocal, castIn, resultLocal, tilingData_.dim);
-                inQueueBias_.FreeTensor(biasLocal);
-            }
-
-            if (tilingData_.activationMode) {
-                Muls(castWeight, resultLocal, (float)-1.0, tilingData_.dim);
-                Exp(castWeight, castWeight, tilingData_.dim);
-                Adds(castWeight, castWeight, (float)1.0, tilingData_.dim);
-                Div(resultLocal, resultLocal, castWeight, tilingData_.dim);
-            }
-
-            Cast(outLocal, resultLocal, RoundMode::CAST_ROUND, tilingData_.dim);
-
-            outQueueY_.EnQue(outLocal);
-            CopyOutY(tilingData_.dim, xOffset + (calcSeqLen + j) * tilingData_.dim);
-        }
-
-        xOffset = xOffset + actSeqLen * tilingData_.dim;
+        PipeBarrier<PIPE_V>();
+        PipeBarrier<PIPE_MTE2>();
+        PipeBarrier<PIPE_MTE3>();
     }
-    inQueueWeight_.FreeTensor(wLocal);
+
+    ReleaseEvents();
 }
 
-// x [batch, seqLen, dim] xLen = dataCount
-template <typename T>
-__aicore__ inline void CausalConv1dUpdate<T>::CopyInX(int64_t xLen, int64_t xInOffset)
-{
-    DataCopyExtParams copyParams;
-    DataCopyPadExtParams<T> padParams = {false, 0, 0, 0};
-    this->GetXInCopyParams(xLen, copyParams);
-    DataCopyPad(inLocal, xGm_[xInOffset], copyParams, padParams);
-}
-
-template <typename T>
-__aicore__ inline void CausalConv1dUpdate<T>::CopyInState(int64_t stateLen, int64_t stateInOffset)
-{
-    DataCopyExtParams copyParams;
-    DataCopyPadExtParams<T> padParams = {false, 0, 0, 0};
-    this->GetStateInCopyParams(stateLen, copyParams);
-    DataCopyPad(inLocal, convStateGm_[stateInOffset], copyParams, padParams);
-}
-
-// weight [width, dim] wLen = width * dim
-template <typename T>
-__aicore__ inline void CausalConv1dUpdate<T>::CopyInWeight(int64_t weightLen, int64_t weightInOffset)
-{
-    LocalTensor<T> wLocal = inQueueWeight_.AllocTensor<T>();
-    DataCopyExtParams copyParams;
-    DataCopyPadExtParams<T> padParams = {false, 0, 0, 0};
-    this->GetWeightInCopyParams(weightLen, copyParams);
-    DataCopyPad(wLocal, weightGm_[weightInOffset], copyParams, padParams);
-    inQueueWeight_.EnQue(wLocal);
-}
-
-// bias [dim, ] bLen = dim
-template <typename T>
-__aicore__ inline void CausalConv1dUpdate<T>::CopyInBias(int64_t biasLen, int64_t biasInOffset)
-{
-    LocalTensor<T> bLocal = inQueueBias_.AllocTensor<T>();
-    DataCopyExtParams copyParams;
-    DataCopyPadExtParams<T> padParams = {false, 0, 0, 0};
-    this->GetBiasInCopyParams(biasLen, copyParams);
-    DataCopyPad(bLocal, biasGm_[biasInOffset], copyParams, padParams);
-    inQueueBias_.EnQue(bLocal);
-}
-
-template <typename T>
-__aicore__ inline void CausalConv1dUpdate<T>::CopyOutState(int64_t stateLen, int64_t stateOutOffset)
-{
-    DataCopyExtParams copyParams;
-    // DataCopyPadExtParams<T> padParams = {false, 0, 0, 0};
-    this->GetStateOutCopyParams(stateLen, copyParams);
-    DataCopyPad<T>(convStateGm_[stateOutOffset], inLocal, copyParams);
-}
-
-template <typename T>
-__aicore__ inline void CausalConv1dUpdate<T>::CopyOutY(int64_t yLen, int64_t yOutOffset)
-{
-    LocalTensor<T> outLocal = outQueueY_.DeQue<T>();
-    DataCopyExtParams copyParams;
-    this->GetYOutCopyParams(yLen, copyParams);
-    DataCopyPad<T>(yGm_[yOutOffset], outLocal, copyParams);
-    outQueueY_.FreeTensor(outLocal);
-}
 } // namespace CausalConv1dUpdateOp
-#endif
+#endif // CAUSAL_CONV1D_UPDATE_H
