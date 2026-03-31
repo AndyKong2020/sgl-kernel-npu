@@ -36,29 +36,33 @@ def torch_reference_causal_conv1d_update(
     bsz, hidden_size, seq_len = hidden_state_t.shape
     kernel_size = weight_t.shape[-1]
 
+    # Compute in float32 to match kernel behavior (kernel casts bf16->fp32,
+    # computes, then casts fp32->bf16).
+    orig_dtype = hidden_state_t.dtype
     full_context = torch.cat(
         [conv_state_t[conv_state_indices], hidden_state_t], dim=-1
-    ).to(weight_t.dtype)
+    ).float()
+    weight_f = weight_t.float()
 
     computation_input = full_context[:, :, -(kernel_size - 1 + seq_len):]
     windows = computation_input.unfold(-1, kernel_size, 1)
-    out = (windows * weight_t[None, :, None, :]).sum(dim=-1)
+    out = (windows * weight_f[None, :, None, :]).sum(dim=-1)
 
     if bias is not None:
-        out = out + bias[None, :, None]
+        out = out + bias.float()[None, :, None]
 
     if activation:
         out = F.silu(out)
 
-    out = out.to(hidden_state_t.dtype)
+    out = out.to(orig_dtype)
 
     target_state_len = (kernel_size - 1) + (seq_len - 1)
     if target_state_len > 0:
-        new_conv_state = full_context[:, :, -target_state_len:]
+        new_conv_state = full_context[:, :, -target_state_len:].to(orig_dtype)
     else:
         new_conv_state = torch.empty(
             bsz, hidden_size, 0,
-            device=hidden_state_t.device, dtype=hidden_state_t.dtype,
+            device=hidden_state_t.device, dtype=orig_dtype,
         )
     conv_state_t[conv_state_indices] = new_conv_state
     conv_state.copy_(conv_state_t.transpose(1, 2))
@@ -146,7 +150,9 @@ def test_npu_causal_conv1d_update(hidden_size, batch_size=1, seq_len=1,
 
     print(f"Output: max_abs_diff={max_abs:.6e}, mean_abs_diff={mean_abs:.6e}, max_rel_diff={max_rel:.6e}")
 
-    ATOL, RTOL = 5e-2, 1e-2
+    # Tight tolerance: bf16 has ~7.8e-3 relative precision; kernel and reference
+    # both compute in float32 so they should nearly match after cast to bf16.
+    ATOL, RTOL = 1e-3, 1e-3
     tol = ATOL + RTOL * out_ref_cpu.abs()
     matched = (diff <= tol).sum().item()
     total = diff.numel()
@@ -155,13 +161,13 @@ def test_npu_causal_conv1d_update(hidden_size, batch_size=1, seq_len=1,
 
     # --- Validate state ---
     state_diff = (conv_state_npu.cpu() - conv_state_ref.cpu()).abs()
-    state_exact = (state_diff < 1e-4).sum().item()
+    state_exact = (state_diff < 1e-6).sum().item()
     state_total = state_diff.numel()
     state_pct = 100.0 * state_exact / state_total
     state_max = state_diff.max().item()
     print(f"State matched: {state_exact}/{state_total} ({state_pct:.2f}%), max_diff={state_max:.6e}")
 
-    passed = matched >= total * 0.95 and state_exact >= state_total * 0.95
+    passed = matched >= total * 0.99 and state_exact >= state_total * 0.99
     if passed:
         print(f"PASS")
     else:
