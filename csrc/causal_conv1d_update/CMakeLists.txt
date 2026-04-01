@@ -20,7 +20,6 @@ include_directories(
 set(CAUSAL_CONV1D_UPDATE_OP_KERNEL_SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/../causal_conv1d_update/op_kernel/causal_conv1d_update.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/../causal_conv1d_update/op_kernel/causal_conv1d_update.h
-  ${CMAKE_CURRENT_SOURCE_DIR}/../causal_conv1d_update/op_kernel/causal_conv1d_update_struct.h
-  ${CMAKE_CURRENT_SOURCE_DIR}/../causal_conv1d_update/op_kernel/causal_conv1d_update_base.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/../causal_conv1d_update/op_kernel/causal_conv1d_update_common.h
   ${CMAKE_CURRENT_SOURCE_DIR}/../causal_conv1d_update/op_kernel/causal_conv1d_update_tilingdata.h
 )
