@@ -131,6 +131,18 @@ at::Tensor lightning_indexer(
  * is inversed.
  */
 at::Tensor tri_inv_col_sweep(const at::Tensor &tensor_in);
+
+at::Tensor causal_conv1d_fla_prefill_impl(
+    const at::Tensor &x, const at::Tensor &weight, const at::Tensor &conv_states,
+    const at::Tensor &query_start_loc, const at::Tensor &cache_indices,
+    const at::Tensor &initial_state_mode, const at::Tensor &bias,
+    bool activation_mode, int64_t pad_slot_id);
+
+at::Tensor causal_conv1d_fla_update_impl(
+    const at::Tensor &x, const at::Tensor &weight, const at::Tensor &conv_state,
+    const at::Tensor &conv_state_indices, const at::Tensor &bias,
+    const at::Tensor &num_accepted_tokens, const at::Tensor &query_start_loc,
+    bool activation_mode, int64_t pad_slot_id);
 } // namespace npu_kernel
 
 } // namespace sglang
