@@ -298,13 +298,6 @@ bool TilingCacheHit(uint64_t hashValue)
     return g_tilingCaptureMap.find(hashValue) != g_tilingCaptureMap.end();
 }
 
-at::Tensor MakeTilingHostTensor(const CausalConv1dTilingData &td, int32_t tiling_size)
-{
-    auto host_buf = at::empty({tiling_size}, at::kByte);
-    memcpy(host_buf.data_ptr<uint8_t>(), &td, sizeof(CausalConv1dTilingData));
-    return host_buf;
-}
-
 void CopyTilingToDevice(const CausalConv1dTilingData &td, at::Tensor &tiling_tensor, const at::Tensor &x,
                         uint64_t hashValue)
 {
@@ -320,17 +313,16 @@ void CopyTilingToDevice(const CausalConv1dTilingData &td, at::Tensor &tiling_ten
         tiling_tensor = at::from_blob(globalTilingBuffer.data_ptr<uint8_t>() + tiling_size * slot,
                                       {tiling_size}, at::kByte);
     } else if (g_tilingCaptureNum >= MAX_CAPTURE_NUM) {
-        // Overflow: one-shot copy via PyTorch H2D (graph-capture safe)
-        auto host_buf = MakeTilingHostTensor(td, tiling_size);
-        tiling_tensor = TorchNpuHelper::CopyTensorHostToDevice(host_buf);
+        // Overflow: one-shot copy (rare, only if > 1024 distinct configs)
+        tiling_tensor = at::empty({tiling_size}, x.options().dtype(at::kByte));
+        aclrtMemcpy(tiling_tensor.data_ptr<uint8_t>(), tiling_size, &td,
+                     sizeof(CausalConv1dTilingData), ACL_MEMCPY_HOST_TO_DEVICE);
     } else {
-        // New config: copy to global buffer slot via PyTorch H2D (graph-capture safe)
+        // New config: store in global buffer and cache
         const uint32_t slot = g_tilingCaptureNum++;
         g_tilingCaptureMap[hashValue] = slot;
-        auto host_buf = MakeTilingHostTensor(td, tiling_size);
-        auto dev_buf = TorchNpuHelper::CopyTensorHostToDevice(host_buf);
-        auto dst = globalTilingBuffer.narrow(0, tiling_size * slot, tiling_size);
-        dst.copy_(dev_buf);
+        aclrtMemcpy(globalTilingBuffer.data_ptr<uint8_t>() + tiling_size * slot, tiling_size,
+                     &td, sizeof(CausalConv1dTilingData), ACL_MEMCPY_HOST_TO_DEVICE);
         tiling_tensor = at::from_blob(globalTilingBuffer.data_ptr<uint8_t>() + tiling_size * slot,
                                       {tiling_size}, at::kByte);
     }
