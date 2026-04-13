@@ -27,11 +27,12 @@ namespace {
 constexpr uint32_t PADDING_BYTE = 32U;
 constexpr int64_t DIM_ALIGN_ELEMS = 16;
 constexpr int64_t MAX_DIM_TILE_SIZE = 4096;
-constexpr int64_t FN_UB_RESERVED_BYTES = 16 * 1024;  // Reserve 16KB for TPipe overhead and event IDs
+constexpr int64_t FN_UB_RESERVED_BYTES = 512;
 constexpr int64_t RING_SLOT_CNT = 5;
 constexpr int64_t FN_OUT_SLOT_CNT = 2;
 constexpr int64_t FN_CALC_FP32_SLOT_CNT = 8;
 constexpr int64_t BF16_FP16_ELEM_BYTES = 2;
+constexpr int64_t MAX_FN_TOKEN_SEQ_RANGE_COUNT = 128;
 
 // --- Tiling helpers (ported from PR #50) ---
 
@@ -74,6 +75,20 @@ struct TokenCoreMappingChoice {
     int64_t tokenBlocksPerCore = 0;
     int64_t tokenCoreTailCnt = 0;
     int64_t blockDim = 0;
+};
+
+enum FnTilingCaseKind : int64_t {
+    FN_TILING_CASE_INVALID = 0,
+    FN_TILING_CASE_TOKEN_FIRST = 1,
+    FN_TILING_CASE_TOKEN_DIM_CO_SPLIT = 2,
+};
+
+struct FnHostPlan {
+    FnTilingCaseKind caseKind = FN_TILING_CASE_INVALID;
+    int64_t executionPlan = FN_EXECUTION_PLAN_INVALID;
+    DimTileChoice baseDimChoice;
+    VarlenTokenTileChoice tokenBlockChoice;
+    TokenCoreMappingChoice tokenCoreMapping;
 };
 
 DimTileChoice ChooseCanonicalUpdateBaseDimChoice(int64_t batch, int64_t dim, int32_t coreNum)
@@ -127,19 +142,12 @@ int64_t ComputeFnUbLimitedBaseDim(uint64_t ubSize)
     return std::min<int64_t>(MAX_DIM_TILE_SIZE, ubLimitedBaseDim);
 }
 
-DimTileChoice ChooseFnTokenFirstBaseDimChoice(int64_t dim, uint64_t ubSize)
+DimTileChoice ChooseFnTokenFirstBaseDimChoice(int64_t dim)
 {
-    if (dim <= 0) {
+    if (dim <= 0 || dim > MAX_DIM_TILE_SIZE) {
         return {};
     }
-    // Check if dim fits in UB; if not, split dim.
-    const int64_t ubLimitedBaseDim = ComputeFnUbLimitedBaseDim(ubSize);
-    if (ubLimitedBaseDim <= 0) {
-        return {};
-    }
-    const int64_t baseDim = std::min<int64_t>(dim, std::min<int64_t>(ubLimitedBaseDim, MAX_DIM_TILE_SIZE));
-    const int64_t baseDimCnt = CeilDivInt64(dim, baseDim);
-    return {baseDim, baseDimCnt, baseDimCnt};
+    return {dim, 1, 1};
 }
 
 DimTileChoice ChooseFnTokenDimCoSplitBaseDimChoice(int64_t dim, uint64_t ubSize, int32_t coreNum)
@@ -223,6 +231,47 @@ TokenCoreMappingChoice BuildFnTokenCoreMappingChoice(int64_t tokenBlockCnt, int6
     }
     mapping.blockDim = mapping.tokenCoreBudget * baseDimCnt;
     return mapping;
+}
+
+FnHostPlan ChooseFnHostPlan(const CausalConv1dTilingData &td, uint64_t ubSize, int32_t coreNum)
+{
+    FnHostPlan plan;
+    if ((td.inputMode != 0 && td.inputMode != 1) || td.batch <= 0 || td.cuSeqlen <= 0 || td.dim <= 0 || coreNum <= 0) {
+        return plan;
+    }
+
+    if (td.dim <= MAX_DIM_TILE_SIZE) {
+        plan.caseKind = FN_TILING_CASE_TOKEN_FIRST;
+        plan.executionPlan = FN_EXECUTION_PLAN_CUTBS;
+        plan.baseDimChoice = ChooseFnTokenFirstBaseDimChoice(td.dim);
+    } else {
+        plan.caseKind = FN_TILING_CASE_TOKEN_DIM_CO_SPLIT;
+        plan.executionPlan = FN_EXECUTION_PLAN_CUTBSD;
+        plan.baseDimChoice = ChooseFnTokenDimCoSplitBaseDimChoice(td.dim, ubSize, coreNum);
+    }
+
+    if (plan.baseDimChoice.baseDim <= 0 || plan.baseDimChoice.baseDimCnt <= 0) {
+        return {};
+    }
+
+    plan.baseDimChoice.gridSize = td.batch * plan.baseDimChoice.baseDimCnt;
+    plan.tokenBlockChoice =
+        ChooseFnTokenBlockChoice(td.cuSeqlen, plan.baseDimChoice.baseDimCnt, plan.executionPlan, coreNum);
+    if (!plan.tokenBlockChoice.enabled || plan.tokenBlockChoice.tokenBlockSize <= 0 ||
+        plan.tokenBlockChoice.tokenBlockCnt <= 0 || plan.tokenBlockChoice.gridSize <= 0) {
+        return {};
+    }
+
+    plan.tokenCoreMapping = BuildFnTokenCoreMappingChoice(
+        plan.tokenBlockChoice.tokenBlockCnt, plan.baseDimChoice.baseDimCnt, plan.executionPlan, coreNum);
+    if (plan.tokenCoreMapping.tokenCoreBudget <= 0 || plan.tokenCoreMapping.blockDim <= 0) {
+        return {};
+    }
+
+    if (plan.tokenCoreMapping.blockDim > static_cast<int64_t>(coreNum)) {
+        plan.tokenCoreMapping.blockDim = static_cast<int64_t>(coreNum);
+    }
+    return plan;
 }
 
 void CheckSameDevice(const at::Tensor &lhs, const at::Tensor &rhs, const char *lhs_name, const char *rhs_name)
@@ -402,18 +451,14 @@ HOST_API at::Tensor causal_conv1d_fla_prefill_impl(const at::Tensor &x, const at
     td.hasInitialStateMode = has_initial_state ? 1 : 0;
     td.hasNumAcceptedTokens = 0;
 
-    // Choose dim tiling plan (respects UB size to avoid overflow)
-    DimTileChoice baseDimChoice = ChooseFnTokenFirstBaseDimChoice(dim, ubSize);
-    int64_t fnPlan;
-    if (baseDimChoice.baseDimCnt <= 1) {
-        fnPlan = FN_EXECUTION_PLAN_CUTBS;
-    } else {
-        fnPlan = FN_EXECUTION_PLAN_CUTBSD;
-    }
+    // Choose unified fn host plan (ported from PR #50).
+    FnHostPlan fnHostPlan = ChooseFnHostPlan(td, ubSize, core_num);
+    DimTileChoice baseDimChoice = fnHostPlan.baseDimChoice;
+    const int64_t fnPlan = fnHostPlan.executionPlan;
     TORCH_CHECK(baseDimChoice.baseDim > 0 && baseDimChoice.baseDimCnt > 0, "Failed to choose valid baseDim for dim=",
                 dim);
+    TORCH_CHECK(fnPlan != FN_EXECUTION_PLAN_INVALID, "Failed to choose valid fn execution plan for dim=", dim);
 
-    baseDimChoice.gridSize = batch * baseDimChoice.baseDimCnt;
     td.baseDim = baseDimChoice.baseDim;
     td.baseDimCnt = baseDimChoice.baseDimCnt;
 
@@ -423,8 +468,7 @@ HOST_API at::Tensor causal_conv1d_fla_prefill_impl(const at::Tensor &x, const at
     td.hasExplicitTokenSeqRanges = 0;
     td.explicitTokenSeqRangeCount = 0;
 
-    VarlenTokenTileChoice tokenChoice =
-        ChooseFnTokenBlockChoice(cuSeqlen, baseDimChoice.baseDimCnt, fnPlan, core_num);
+    VarlenTokenTileChoice tokenChoice = fnHostPlan.tokenBlockChoice;
     TORCH_CHECK(tokenChoice.enabled && tokenChoice.tokenBlockSize > 0 && tokenChoice.tokenBlockCnt > 0,
                 "Failed to compute token tiling plan");
 
@@ -435,25 +479,20 @@ HOST_API at::Tensor causal_conv1d_fla_prefill_impl(const at::Tensor &x, const at
     // Building these requires reading queryStartLoc from device (.cpu() triggers sync),
     // so only do it when the tiling config is new (cache miss).
     // For cache hits, the ranges are already stored in the cached tiling data.
-    const bool needExplicitRanges = (inputMode == 0 && tokenChoice.tokenBlockCnt <= 128);
+    const bool needExplicitRanges = (inputMode == 0 && tokenChoice.tokenBlockCnt <= MAX_FN_TOKEN_SEQ_RANGE_COUNT);
     if (!needExplicitRanges) {
         td.hasExplicitTokenSeqRanges = 0;
         td.explicitTokenSeqRangeCount = 0;
     }
 
     // Core mapping
-    TokenCoreMappingChoice coreMapping =
-        BuildFnTokenCoreMappingChoice(tokenChoice.tokenBlockCnt, baseDimChoice.baseDimCnt, fnPlan, core_num);
+    TokenCoreMappingChoice coreMapping = fnHostPlan.tokenCoreMapping;
     TORCH_CHECK(coreMapping.blockDim > 0, "Failed to compute core mapping");
 
-    // The kernel's actual grid depends on which Process path it takes:
-    //   baseDimCnt > 1 → ProcessDefault, gridSize = batch * baseDimCnt
-    //   baseDimCnt == 1 → ProcessVarlenTokenTiled, gridSize = tokenBlockCnt * baseDimCnt
-    // Set blockDim to match so each block handles exactly one task.
-    int64_t effectiveGridSize = (baseDimChoice.baseDimCnt > 1)
-        ? (batch * baseDimChoice.baseDimCnt)
-        : tokenChoice.gridSize;
-    int32_t block_dim = static_cast<int32_t>(effectiveGridSize);
+    // PR #50 always uses the token-tiling grid as the effective fn launch grid.
+    const int64_t effectiveGridSize = tokenChoice.gridSize;
+    const int64_t mappedBlockDim = std::min<int64_t>(effectiveGridSize, coreMapping.blockDim);
+    int32_t block_dim = static_cast<int32_t>(mappedBlockDim);
     if (block_dim <= 0) {
         block_dim = 1;
     }
@@ -553,6 +592,48 @@ HOST_API at::Tensor causal_conv1d_fla_update_impl(const at::Tensor &x, const at:
     TORCH_CHECK(conv_state.size(2) == dim, "conv_state.shape[2] must equal dim");
     TORCH_CHECK(stateLen >= width - 1, "conv_state.shape[1] must be >= width - 1");
 
+    if (has_query_loc) {
+        TORCH_CHECK(query_start_loc.dim() == 1, "query_start_loc must be 1D when provided");
+        TORCH_CHECK(query_start_loc.scalar_type() == at::kLong, "query_start_loc dtype must be int64");
+    }
+    if (has_indices) {
+        TORCH_CHECK(conv_state_indices.dim() == 1, "conv_state_indices must be 1D when provided");
+        TORCH_CHECK(conv_state_indices.scalar_type() == at::kLong, "conv_state_indices dtype must be int64");
+    }
+    if (has_num_accept) {
+        TORCH_CHECK(num_accepted_tokens.dim() == 1, "num_accepted_tokens must be 1D when provided");
+        TORCH_CHECK(num_accepted_tokens.scalar_type() == at::kLong, "num_accepted_tokens dtype must be int64");
+        TORCH_CHECK(width == 4, "num_accepted_tokens is only supported for width=4");
+    }
+
+    if (x.dim() == 2 && has_query_loc && query_start_loc.size(0) > 0) {
+        const int64_t batch_from_qsl = query_start_loc.size(0) - 1;
+        if (batch_from_qsl != batch) {
+            inputMode = 0;  // 2D varlen decode
+            batch = batch_from_qsl;
+            seqLen = 0;
+            cuSeqlen = x.size(0);
+        }
+    }
+
+    if (has_indices) {
+        TORCH_CHECK(conv_state_indices.size(0) == batch, "conv_state_indices.size must equal batch");
+    } else {
+        TORCH_CHECK(conv_state.size(0) >= batch,
+                    "conv_state.shape[0] must be >= batch when conv_state_indices is absent");
+    }
+    if (has_query_loc && inputMode != 0) {
+        TORCH_CHECK(query_start_loc.size(0) == batch + 1, "query_start_loc.size must equal batch + 1");
+    }
+    if (has_num_accept) {
+        TORCH_CHECK(num_accepted_tokens.size(0) == batch, "num_accepted_tokens.size must equal batch");
+        if (inputMode == 1) {
+            const int64_t reqStateLen = (width - 1) + (seqLen - 1);
+            TORCH_CHECK(stateLen >= reqStateLen,
+                        "spec decode requires conv_state.shape[1] >= (width - 1) + (seq_len - 1)");
+        }
+    }
+
     auto ascendc_platform = platform_ascendc::PlatformAscendCManager::GetInstance();
     TORCH_CHECK(ascendc_platform != nullptr, "Failed to acquire AscendC platform manager");
     const int32_t core_num = static_cast<int32_t>(ascendc_platform->GetCoreNumAiv());
@@ -578,9 +659,7 @@ HOST_API at::Tensor causal_conv1d_fla_update_impl(const at::Tensor &x, const at:
     td.explicitTokenSeqRangeCount = 0;
 
     const int64_t gridSize = baseDimChoice.gridSize;
-    // Use gridSize as blockDim so that each block handles exactly one task.
-    // The NPU scheduler maps blocks to physical cores internally.
-    int32_t block_dim = static_cast<int32_t>(gridSize);
+    int32_t block_dim = static_cast<int32_t>(std::min<int64_t>(gridSize, core_num));
     if (block_dim <= 0) {
         block_dim = 1;
     }
