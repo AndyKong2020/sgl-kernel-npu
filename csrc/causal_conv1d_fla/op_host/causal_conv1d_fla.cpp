@@ -489,10 +489,12 @@ HOST_API at::Tensor causal_conv1d_fla_prefill_impl(const at::Tensor &x, const at
     TokenCoreMappingChoice coreMapping = fnHostPlan.tokenCoreMapping;
     TORCH_CHECK(coreMapping.blockDim > 0, "Failed to compute core mapping");
 
-    // PR #50 always uses the token-tiling grid as the effective fn launch grid.
-    const int64_t effectiveGridSize = tokenChoice.gridSize;
-    const int64_t mappedBlockDim = std::min<int64_t>(effectiveGridSize, coreMapping.blockDim);
-    int32_t block_dim = static_cast<int32_t>(mappedBlockDim);
+    // Keep the repo's runtime launch contract: block_dim is the logical task grid.
+    // ProcessDefault can internally stride over tasks, but ProcessVarlenTokenTiled
+    // consumes exactly one direct block task per launched block.
+    const int64_t effectiveGridSize =
+        (baseDimChoice.baseDimCnt > 1) ? (batch * baseDimChoice.baseDimCnt) : tokenChoice.gridSize;
+    int32_t block_dim = static_cast<int32_t>(effectiveGridSize);
     if (block_dim <= 0) {
         block_dim = 1;
     }
@@ -659,7 +661,8 @@ HOST_API at::Tensor causal_conv1d_fla_update_impl(const at::Tensor &x, const at:
     td.explicitTokenSeqRangeCount = 0;
 
     const int64_t gridSize = baseDimChoice.gridSize;
-    int32_t block_dim = static_cast<int32_t>(std::min<int64_t>(gridSize, core_num));
+    // Keep one logical block per task for the runtime launch ABI used here.
+    int32_t block_dim = static_cast<int32_t>(gridSize);
     if (block_dim <= 0) {
         block_dim = 1;
     }
