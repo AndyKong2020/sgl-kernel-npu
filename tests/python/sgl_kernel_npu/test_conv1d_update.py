@@ -8,6 +8,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("TestScript")
 torch.manual_seed(42)
 
+PROFILE_LAUNCH_CNT = 20
+
 
 def npu_causal_conv1d_update_ref_graphsafe(
     hidden_state: torch.Tensor,
@@ -206,6 +208,94 @@ def test_vllm_causal_conv1d_update_ref_control_tensor_dtypes():
         assert torch.allclose(states[torch.int32], states[torch.int64], atol=1e-5, rtol=1e-5)
 
 
+def profile_npu_causal_conv1d_fla_update(
+    launch_cnt: int = PROFILE_LAUNCH_CNT,
+):
+    """Profile the update op with detailed torch_npu profiler collection."""
+    try:
+        import torch_npu
+        import sgl_kernel_npu  # noqa: F401
+    except ImportError as e:
+        print(f"Skipping profile (import failed): {e}")
+        return
+
+    if not hasattr(torch.ops.npu, "causal_conv1d_fla_update"):
+        print("causal_conv1d_fla_update operator not registered!")
+        return
+
+    torch.manual_seed(42)
+    cfg = {
+        "name": "spec_decode_large_batch",
+        "bsz": 128,
+        "dim": 12288,
+        "seq_len": 4,
+        "width": 4,
+        "state_len": 6,
+        "bias": False,
+        "act": True,
+        "nat": 4,
+    }
+    bsz = cfg["bsz"]
+    dim = cfg["dim"]
+    seq_len = cfg["seq_len"]
+    width = cfg["width"]
+    state_len = cfg["state_len"]
+    cache_len = bsz + 2
+
+    weight = torch.randn(width, dim, device="npu", dtype=torch.bfloat16)
+    x = torch.randn(bsz, seq_len, dim, device="npu", dtype=torch.bfloat16)
+    conv_state = torch.randn(cache_len, state_len, dim, device="npu", dtype=torch.bfloat16)
+    conv_state_indices = torch.arange(bsz, device="npu", dtype=torch.int64)
+    num_accepted_tokens = torch.full((bsz,), cfg["nat"], device="npu", dtype=torch.int64)
+
+    def run_op():
+        return torch.ops.npu.causal_conv1d_fla_update(
+            x=x,
+            weight=weight,
+            conv_state=conv_state,
+            conv_state_indices=conv_state_indices,
+            bias=None,
+            activation_mode=cfg["act"],
+            pad_slot_id=-1,
+            num_accepted_tokens=num_accepted_tokens,
+        )
+
+    warmup = 5
+    trace_dir = f"./causal_conv1d_fla_update_profile_results/{cfg['name']}"
+
+    with torch_npu.profiler.profile(
+        activities=[
+            torch_npu.profiler.ProfilerActivity.CPU,
+            torch_npu.profiler.ProfilerActivity.NPU,
+        ],
+        schedule=torch_npu.profiler.schedule(
+            wait=0, warmup=0, active=1, repeat=1, skip_first=0
+        ),
+        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(trace_dir),
+    ) as prof:
+        for _ in range(warmup):
+            run_op()
+
+        torch.npu.synchronize()
+        start = torch.npu.Event(enable_timing=True)
+        end = torch.npu.Event(enable_timing=True)
+        start.record()
+        for _ in range(launch_cnt):
+            run_op()
+        end.record()
+        torch.npu.synchronize()
+
+        elapsed_ms = start.elapsed_time(end)
+        avg_ms = elapsed_ms / max(launch_cnt, 1)
+        avg_us = avg_ms * 1000.0
+        prof.step()
+
+    print(f"[PROFILE] case={cfg['name']}")
+    print(f"[PROFILE] launches={launch_cnt} warmup={warmup}")
+    print(f"[PROFILE] avg_time_ms={avg_ms:.6f} avg_time_us={avg_us:.3f}")
+    print(f"[PROFILE] trace_dir={trace_dir}")
+
+
 def test_npu_causal_conv1d_fla_update():
     """Test the NPU causal_conv1d_fla_update operator."""
     try:
@@ -327,4 +417,19 @@ def test_npu_causal_conv1d_fla_update():
 
 
 if __name__ == "__main__":
-    test_npu_causal_conv1d_fla_update()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="causal_conv1d_fla_update test/prof entry")
+    parser.add_argument("--profile", action="store_true", help="Run simple profiling flow")
+    parser.add_argument(
+        "--profile-launches",
+        type=int,
+        default=PROFILE_LAUNCH_CNT,
+        help="Number of launches used for timing",
+    )
+    args = parser.parse_args()
+
+    if args.profile:
+        profile_npu_causal_conv1d_fla_update(launch_cnt=args.profile_launches)
+    else:
+        test_npu_causal_conv1d_fla_update()
