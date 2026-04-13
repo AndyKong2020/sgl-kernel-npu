@@ -9,6 +9,123 @@ logger = logging.getLogger("TestScript")
 torch.manual_seed(42)
 
 
+def npu_causal_conv1d_update_ref_graphsafe(
+    hidden_state: torch.Tensor,
+    weight: torch.Tensor,
+    conv_state: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    silu_activation: bool = True,
+    num_accepted_tokens: Optional[torch.Tensor] = None,
+    preserve_state_layout: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Tensorized reference matching the deleted sglang helper's call pattern.
+
+    Args:
+        hidden_state: [batch, dim, seq_len]
+        weight: [dim, width]
+        conv_state: [batch, dim, state_len]
+        bias: [dim]
+        silu_activation: whether to apply SiLU
+        num_accepted_tokens: optional [batch] tensor enabling speculative
+            decoding semantics. When omitted, this matches the deleted helper's
+            behavior: return the rolling window
+            [history_{tail}, x_0, ..., x_{seq_len-1}] of length
+            (width - 1) + (seq_len - 1).
+        preserve_state_layout: when True, keep conv_state's original length and
+            only update the prefix that the custom op mutates. This is useful
+            for test/reference code that works against a larger global cache.
+
+    Returns:
+        out: [batch, dim, seq_len]
+        new_conv_state: [batch, dim, state_len] for speculative mode, or
+            [batch, dim, (width - 1) + (seq_len - 1)] for the deleted helper's
+            normal mode.
+    """
+    if hidden_state.dim() != 3:
+        raise ValueError(
+            f"hidden_state must be [batch, dim, seq_len], got {tuple(hidden_state.shape)}"
+        )
+    if weight.dim() != 2:
+        raise ValueError(f"weight must be [dim, width], got {tuple(weight.shape)}")
+    if conv_state.dim() != 3:
+        raise ValueError(
+            f"conv_state must be [batch, dim, state_len], got {tuple(conv_state.shape)}"
+        )
+
+    batch, dim, seq_len = hidden_state.shape
+    weight_dim, width = weight.shape
+    if weight_dim != dim:
+        raise ValueError(f"weight.shape[0] ({weight_dim}) must equal dim ({dim})")
+    if conv_state.shape[:2] != (batch, dim):
+        raise ValueError(
+            "conv_state must align with hidden_state on [batch, dim], got "
+            f"{tuple(conv_state.shape[:2])} vs {(batch, dim)}"
+        )
+
+    state_len = conv_state.shape[-1]
+    history_len = width - 1
+    if state_len < history_len:
+        raise ValueError(
+            f"conv_state.shape[-1] ({state_len}) must be >= width - 1 ({history_len})"
+        )
+
+    hidden_state_w = hidden_state.to(weight.dtype)
+    conv_state_w = conv_state.to(weight.dtype)
+    is_spec = (num_accepted_tokens is not None) and (width == 4)
+
+    if num_accepted_tokens is None and not preserve_state_layout:
+        full_context = torch.cat([conv_state_w, hidden_state_w], dim=-1)
+        context = full_context[..., -(history_len + seq_len) :]
+        target_state_len = history_len + (seq_len - 1)
+        if target_state_len > 0:
+            new_conv_state = full_context[..., -target_state_len:]
+        else:
+            new_conv_state = conv_state_w.new_empty((batch, dim, 0))
+    else:
+        if is_spec:
+            max_offset = max(state_len - history_len, 0)
+            offsets = (
+                num_accepted_tokens.to(device=conv_state.device, dtype=torch.long) - 1
+            ).clamp_(min=0, max=max_offset)
+        else:
+            offsets = torch.zeros((batch,), device=conv_state.device, dtype=torch.long)
+
+        history_positions = offsets.unsqueeze(1) + torch.arange(
+            history_len, device=conv_state.device, dtype=torch.long
+        ).unsqueeze(0)
+        history_positions = history_positions.unsqueeze(1).expand(-1, dim, -1)
+        history = conv_state_w.gather(2, history_positions)
+        context = torch.cat([history, hidden_state_w], dim=-1)
+
+    windows = context.unfold(-1, width, 1)
+    out = (windows * weight.unsqueeze(0).unsqueeze(2)).sum(dim=-1)
+    if bias is not None:
+        out = out + bias.to(weight.dtype).view(1, dim, 1)
+    if silu_activation:
+        out = F.silu(out)
+    out = out.to(hidden_state.dtype).contiguous()
+
+    if num_accepted_tokens is None and not preserve_state_layout:
+        return out, new_conv_state.to(conv_state.dtype).contiguous()
+
+    updated_conv_state = conv_state.clone()
+    if is_spec and state_len >= (width - 2) + seq_len:
+        keep = width - 2
+        shifted_positions = offsets.unsqueeze(1) + 1 + torch.arange(
+            keep, device=conv_state.device, dtype=torch.long
+        ).unsqueeze(0)
+        shifted_positions = shifted_positions.unsqueeze(1).expand(-1, dim, -1)
+        shifted = conv_state.gather(2, shifted_positions)
+        spec_prefix = torch.cat([shifted, hidden_state.to(conv_state.dtype)], dim=-1)
+        updated_conv_state[..., : keep + seq_len] = spec_prefix
+    else:
+        updated_conv_state[..., :history_len] = context[..., -history_len:].to(
+            conv_state.dtype
+        )
+
+    return out, updated_conv_state.contiguous()
+
+
 def vllm_causal_conv1d_update_ref(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -18,65 +135,75 @@ def vllm_causal_conv1d_update_ref(
     activation: bool = True,
     num_accepted_tokens: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """vLLM-style reference implementation for causal_conv1d_update.
-
-    Faithfully models both normal decode and speculative decoding semantics:
-      - Normal: reads history from state[0:width-1], writes back last (width-1) tokens.
-      - Spec (num_accepted_tokens provided, width==4): reads history from
-        state[offset:offset+width-1] where offset=accepted-1, writes back
-        [shifted_hist, all_input_tokens] into state[0:2+seq_len].
+    """Graph-safe reference aligned with the custom update op semantics.
 
     Layout: x [batch, seq_len, dim], weight [width, dim],
-            conv_state [num_cache_lines, state_len, dim].
+    conv_state [num_cache_lines, state_len, dim].
     """
-    # Transpose to [batch, dim, seq_len] / [lines, dim, state_len] for unfold-based conv.
     batch, seq_len, dim = x.shape
     width = weight.shape[0]
-    hidden_state = x.transpose(1, 2)         # [B, D, S]
-    w = weight.transpose(0, 1)               # [D, K]
-    cs = conv_state.transpose(1, 2)          # [lines, D, state_len]
-    state_len = cs.shape[2]
+    if conv_state_indices.dim() != 1 or conv_state_indices.shape[0] != batch:
+        raise ValueError(
+            "conv_state_indices must be [batch], got "
+            f"{tuple(conv_state_indices.shape)} for batch={batch}"
+        )
 
-    is_spec = (num_accepted_tokens is not None) and (width == 4)
+    local_state_indices = conv_state_indices.to(
+        device=conv_state.device, dtype=torch.long
+    )
+    local_conv_state = conv_state.index_select(0, local_state_indices).transpose(
+        1, 2
+    )
+    out, updated_local_state = npu_causal_conv1d_update_ref_graphsafe(
+        hidden_state=x.transpose(1, 2).contiguous(),
+        weight=weight.transpose(0, 1).contiguous(),
+        conv_state=local_conv_state,
+        bias=bias,
+        silu_activation=activation,
+        num_accepted_tokens=num_accepted_tokens,
+        preserve_state_layout=True,
+    )
+    conv_state.index_copy_(0, local_state_indices, updated_local_state.transpose(1, 2))
+    return out.transpose(1, 2).contiguous()
 
-    if is_spec:
-        # Per-batch state-token offset: accepted - 1, clamped to [0, state_len - (width-1)]
-        offsets = (num_accepted_tokens - 1).clamp(min=0, max=state_len - (width - 1))
-    else:
-        offsets = torch.zeros(batch, dtype=torch.long, device=x.device)
 
-    out_list = []
-    for b in range(batch):
-        ci = int(conv_state_indices[b].item())
-        off = int(offsets[b].item())
-        hist = cs[ci, :, off:off + (width - 1)]   # [D, width-1]
-        ctx = torch.cat([hist, hidden_state[b]], dim=-1).to(w.dtype)  # [D, width-1+S]
+def test_vllm_causal_conv1d_update_ref_control_tensor_dtypes():
+    """The Python reference should accept both int32/int64 control tensors."""
+    torch.manual_seed(123)
 
-        # Correlation: out[s] = sum_k ctx[s+k] * w[k]
-        windows = ctx.unfold(-1, width, 1)  # [D, S, K]
-        o = (windows * w[:, None, :]).sum(dim=-1)  # [D, S]
+    test_configs = [
+        {"batch": 3, "seq_len": 4, "dim": 8, "width": 4, "state_len": 6, "nat": [4, 4, 4]},
+        {"batch": 3, "seq_len": 3, "dim": 8, "width": 3, "state_len": 5, "nat": [1, 3, 2]},
+    ]
 
-        if bias is not None:
-            o = o + bias[:, None].to(o.dtype)
-        if activation:
-            o = F.silu(o)
+    for cfg in test_configs:
+        x = torch.randn(cfg["batch"], cfg["seq_len"], cfg["dim"])
+        weight = torch.randn(cfg["width"], cfg["dim"])
+        bias = torch.randn(cfg["dim"])
+        conv_state_base = torch.randn(cfg["batch"] + 2, cfg["state_len"], cfg["dim"])
 
-        out_list.append(o.to(x.dtype))
+        outputs = {}
+        states = {}
+        for dtype in (torch.int32, torch.int64):
+            conv_state = conv_state_base.clone()
+            indices = torch.tensor([2, 0, 1], dtype=dtype)
+            num_accepted_tokens = torch.tensor(cfg["nat"], dtype=dtype)
 
-        # State writeback
-        if is_spec and state_len >= 2 + seq_len:
-            # Shift: [old[off+1], old[off+2], x0, x1, ..., x_{S-1}]
-            keep = width - 2  # == 2 for width=4
-            shifted = cs[ci, :, off + 1:off + 1 + keep] if off + 1 + keep <= state_len else cs[ci, :, :keep]
-            new_state = torch.cat([shifted, hidden_state[b].to(cs.dtype)], dim=-1)  # [D, 2+S]
-            cs[ci, :, :2 + seq_len] = new_state
-        else:
-            # Normal: last (width-1) tokens of ctx
-            cs[ci, :, :width - 1] = ctx[:, -(width - 1):].to(cs.dtype)
+            y = vllm_causal_conv1d_update_ref(
+                x,
+                weight,
+                conv_state,
+                indices,
+                bias=bias,
+                activation=True,
+                num_accepted_tokens=num_accepted_tokens,
+            )
+            y.view(cfg["batch"] * cfg["seq_len"], cfg["dim"])
+            outputs[dtype] = y
+            states[dtype] = conv_state
 
-    conv_state.copy_(cs.transpose(1, 2))
-    out = torch.stack(out_list, dim=0).transpose(1, 2)  # [B, S, D]
-    return out
+        assert torch.allclose(outputs[torch.int32], outputs[torch.int64], atol=1e-5, rtol=1e-5)
+        assert torch.allclose(states[torch.int32], states[torch.int64], atol=1e-5, rtol=1e-5)
 
 
 def test_npu_causal_conv1d_fla_update():
