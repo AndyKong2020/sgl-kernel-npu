@@ -226,8 +226,8 @@ def profile_npu_causal_conv1d_fla_update(
     torch.manual_seed(42)
     cfg = {
         "name": "spec_decode_large_batch",
-        "bsz": 128,
-        "dim": 12288,
+        "bsz": 140,
+        "dim": 4096,
         "seq_len": 4,
         "width": 4,
         "state_len": 6,
@@ -344,6 +344,9 @@ def test_npu_causal_conv1d_fla_update():
          "state_len": 6, "bias": False, "act": True, "nat": 4},
         {"name": "spec_decode_large", "bsz": 32, "dim": 12288, "seq_len": 4, "width": 4,
          "state_len": 6, "bias": False, "act": True, "nat": 4},
+        {"name": "spec_decode_large_batch", "bsz": 128, "dim": 12288, "seq_len": 4, "width": 4,
+         "state_len": 6, "bias": False, "act": True, "nat": 4},
+
     ]
 
     for cfg in test_configs:
